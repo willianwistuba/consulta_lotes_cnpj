@@ -1,0 +1,1091 @@
+# ==============================================================================
+#  Cole o conteúdo a partir da linha 10 no Google Colab (https://colab.research.google.com/)
+#  CONSULTA DE CNPJ EM LOTE (Minha Receita · ReceitaWS · CNPJ.ws pública)
+#  Célula única: execute, preencha o formulário e clique em "Consultar".
+#  O andamento aparece aqui embaixo, linha a linha. Para interromper, use o
+#  botão ■ da célula: o que já foi consultado é exportado e baixado.
+#  Script produzido especialmente para o 1º Encontro Nacional da Rede Ciber - Brasília, Ministério da Justiça - Outubro de 2026
+#  Autor: Prof. Willian Wistuba (TCESP - Linkedin https://www.linkedin.com/in/prof-willian-wistuba)
+# ==============================================================================
+
+import json
+import os
+import re
+import subprocess
+import sys
+import time
+import zipfile
+from datetime import datetime
+from zoneinfo import ZoneInfo
+
+try:
+    import openpyxl  # noqa: F401
+except ImportError:  # o Colab já traz o openpyxl; isto é só garantia
+    subprocess.run([sys.executable, "-m", "pip", "install", "-q", "openpyxl"], check=False)
+
+import pandas as pd
+import requests
+from IPython.display import HTML, display
+
+try:
+    from google.colab import files as colab_files
+    from google.colab import output as colab_output
+    EM_COLAB = True
+except ImportError:
+    colab_files = colab_output = None
+    EM_COLAB = False
+
+FUSO = ZoneInfo("America/Sao_Paulo")
+PASTA_BASE = "/content" if EM_COLAB else os.getcwd()
+
+# ------------------------------------------------------------------------------
+# Fontes
+# Limites documentados: ReceitaWS (plano gratuito) e CNPJ.ws (API pública)
+# aceitam 3 consultas por minuto por IP. O intervalo padrão de 21 s respeita isso.
+# A CNPJ.ws bloqueia o IP por 1 hora se receber muitas requisições acima do
+# limite, por isso o script espera a liberação em vez de insistir.
+# ------------------------------------------------------------------------------
+FONTES = {
+    "minhareceita": {
+        "nome": "Minha Receita",
+        "url": "https://minhareceita.org/{cnpj}",
+        "intervalo": 1.0,
+    },
+    "receitaws": {
+        "nome": "ReceitaWS",
+        "url": "https://receitaws.com.br/v1/cnpj/{cnpj}",
+        "intervalo": 21.0,
+    },
+    "cnpjws": {
+        "nome": "CNPJ.ws (pública)",
+        "url": "https://publica.cnpj.ws/cnpj/{cnpj}",
+        "intervalo": 21.0,
+    },
+}
+
+ROTULO_STATUS = {
+    "ok": "✅ encontrado",
+    "nao_encontrado": "⚪ não encontrado",
+    "invalido": "⚠️ recusado como inválido",
+    "limite": "⏳ limite de requisições",
+    "erro": "❌ erro",
+    "interrompido": "⏹️ interrompido",
+}
+
+AVISO_FONTES = (
+    "Dados obtidos de serviços públicos não oficiais que espelham a base de CNPJ "
+    "da Receita Federal e podem estar defasados. Para uso formal, confirmar no "
+    "Comprovante de Inscrição e de Situação Cadastral emitido pela RFB."
+)
+
+
+def agora():
+    return datetime.now(FUSO)
+
+
+def agora_iso():
+    return agora().isoformat(timespec="seconds")
+
+
+def hora():
+    return agora().strftime("%H:%M:%S")
+
+
+def esperar(segundos, motivo):
+    """Espera mostrando contagem regressiva na mesma linha da saída."""
+    fim = time.monotonic() + segundos
+    if segundos < 2:
+        time.sleep(max(0.0, segundos))
+        return
+    while True:
+        resta = fim - time.monotonic()
+        if resta <= 0:
+            break
+        print(f"\r      ⏳ {motivo}: {resta:4.0f}s ", end="", flush=True)
+        time.sleep(min(1.0, resta))
+    print(f"\r      ⏳ {motivo}: ok{' ' * 12}", flush=True)
+
+
+# ==============================================================================
+# 1. Identificação e validação de CNPJs (numéricos e alfanuméricos)
+# ==============================================================================
+# CNPJ formatado dentro de texto corrido. Aceita o formato alfanumérico
+# (12 posições com letras ou números + 2 dígitos verificadores numéricos).
+RE_MASCARA = re.compile(
+    r"(?<![A-Z0-9])[A-Z0-9]{2}\.[A-Z0-9]{3}\.[A-Z0-9]{3}/[A-Z0-9]{4}-\d{2}(?![A-Z0-9])",
+    re.IGNORECASE,
+)
+RE_LIMPO = re.compile(r"^[A-Z0-9]{12}\d{2}$")
+RE_SEPARADORES = re.compile(r"[\r\n;,\t]+")
+RE_PONTUACAO = re.compile(r"[\s./\-\"']")
+
+PESOS_1 = [5, 4, 3, 2, 9, 8, 7, 6, 5, 4, 3, 2]
+PESOS_2 = [6] + PESOS_1
+
+
+def _dv(base, pesos):
+    # Para o CNPJ alfanumérico, cada caractere vale (código ASCII - 48);
+    # para dígitos isso dá o próprio número, então a regra serve para os dois.
+    soma = sum((ord(c) - 48) * p for c, p in zip(base, pesos))
+    resto = soma % 11
+    return "0" if resto < 2 else str(11 - resto)
+
+
+def dv_valido(cnpj):
+    if not RE_LIMPO.match(cnpj) or len(set(cnpj)) == 1:
+        return False
+    d1 = _dv(cnpj[:12], PESOS_1)
+    d2 = _dv(cnpj[:12] + d1, PESOS_2)
+    return cnpj[12:] == d1 + d2
+
+
+def formatar_cnpj(c):
+    return f"{c[:2]}.{c[2:5]}.{c[5:8]}/{c[8:12]}-{c[12:]}" if len(c) == 14 else c
+
+
+def extrair_cnpjs(texto):
+    """Aceita: um por linha; separados por ; ou , (ou tabulação); e CNPJs
+    formatados no meio de texto corrido. Devolve (válidos, inválidos, duplicados)."""
+    texto = (texto or "").upper()
+    candidatos = []  # (cnpj_limpo, trecho_original, observacao)
+
+    for token in RE_SEPARADORES.split(texto):
+        token = token.strip()
+        if not token:
+            continue
+        formatados = RE_MASCARA.findall(token)
+        if formatados:
+            for f in formatados:
+                candidatos.append((re.sub(r"[^A-Z0-9]", "", f), f, ""))
+            continue
+        limpo = RE_PONTUACAO.sub("", token)
+        if limpo.isdigit() and 12 <= len(limpo) <= 13:
+            # Caso típico de CNPJ colado do Excel sem os zeros à esquerda
+            candidatos.append((limpo.zfill(14), token, "zeros à esquerda completados"))
+        elif RE_LIMPO.match(limpo):
+            candidatos.append((limpo, token, ""))
+
+    validos, invalidos, duplicados, vistos = [], [], [], set()
+    for limpo, original, obs in candidatos:
+        if limpo in vistos:
+            duplicados.append(original)
+            continue
+        vistos.add(limpo)
+        registro = {"cnpj": limpo, "cnpj_formatado": formatar_cnpj(limpo),
+                    "entrada_original": original, "observacao": obs}
+        (validos if dv_valido(limpo) else invalidos).append(registro)
+    return validos, invalidos, duplicados
+
+
+# ==============================================================================
+# 2. Consulta HTTP com retentativa e respeito ao limite de cada fonte
+# ==============================================================================
+SESSAO = requests.Session()
+SESSAO.headers.update({
+    "User-Agent": "Mozilla/5.0 (X11; Linux x86_64) consulta-cnpj-lote/1.0",
+    "Accept": "application/json",
+})
+
+
+def _mensagem_corpo(corpo):
+    if isinstance(corpo, dict):
+        for chave in ("message", "detalhes", "detahes", "titulo", "error"):
+            if corpo.get(chave):
+                return str(corpo[chave])
+    return ""
+
+
+def interpretar_resposta(chave, http, corpo):
+    """Converte a resposta de cada fonte em (status, mensagem)."""
+    msg = _mensagem_corpo(corpo)
+
+    if http == 429:
+        return "limite", msg or "limite de requisições atingido"
+
+    # ReceitaWS costuma responder HTTP 200 com {"status": "ERROR", "message": ...}
+    if chave == "receitaws" and isinstance(corpo, dict) and str(corpo.get("status", "")).upper() == "ERROR":
+        m = msg.lower()
+        if "too many" in m or "muitas" in m or "limite" in m:
+            return "limite", msg
+        if "inválido" in m or "invalido" in m:
+            return "invalido", msg
+        if "rejeitado" in m or "não encontrado" in m or "nao encontrado" in m or "not found" in m:
+            return "nao_encontrado", msg
+        return "erro", msg or "a fonte retornou erro"
+
+    if http == 200:
+        if isinstance(corpo, dict) and corpo:
+            return "ok", ""
+        return "erro", "resposta vazia ou fora do formato JSON"
+    if http == 404:
+        return "nao_encontrado", msg or "CNPJ não localizado na base da fonte"
+    if http == 400:
+        return "invalido", msg or "a fonte considerou o CNPJ inválido"
+    if http in (401, 403):
+        return "erro", msg or "acesso negado pela fonte (possível bloqueio do IP do Colab)"
+    if http is not None and http >= 500:
+        return "erro", msg or f"falha no servidor da fonte (HTTP {http})"
+    return "erro", msg or f"HTTP {http}"
+
+
+def _espera_limite(resposta, padrao=61):
+    try:
+        valor = int(float(resposta.headers.get("Retry-After", "")))
+        return max(5, min(valor + 1, 180))
+    except (TypeError, ValueError):
+        return padrao
+
+
+def consultar_fonte(chave, cnpj, timeout=30, max_tentativas=3, log=print):
+    cfg = FONTES[chave]
+    url = cfg["url"].format(cnpj=cnpj)
+    reg = {
+        "fonte": cfg["nome"], "chave_fonte": chave, "url": url,
+        "status": None, "http_status": None, "mensagem": "",
+        "tentativas": 0, "consultado_em": None, "duracao_s": None, "dados": None,
+    }
+    for tentativa in range(1, max_tentativas + 1):
+        reg["tentativas"] = tentativa
+        reg["consultado_em"] = agora_iso()
+        inicio = time.monotonic()
+        espera = 0
+        corpo = None
+        try:
+            r = SESSAO.get(url, timeout=timeout)
+            http = r.status_code
+            try:
+                corpo = r.json()
+            except ValueError:
+                corpo = None
+            status, msg = interpretar_resposta(chave, http, corpo)
+            if status == "limite":
+                espera = _espera_limite(r)
+            elif status == "erro" and (http >= 500):
+                espera = 10 * tentativa
+        except requests.Timeout:
+            http, status, msg, espera = None, "erro", f"tempo esgotado ({timeout}s)", 10 * tentativa
+        except requests.RequestException as e:
+            http, status, msg, espera = None, "erro", f"falha de conexão: {type(e).__name__}", 10 * tentativa
+
+        reg.update({
+            "status": status, "http_status": http, "mensagem": msg,
+            "duracao_s": round(time.monotonic() - inicio, 2),
+            "dados": corpo if status == "ok" else None,
+        })
+
+        recuperavel = status == "limite" or (status == "erro" and espera > 0)
+        if not recuperavel or tentativa == max_tentativas:
+            break
+        log(f"      ↻ {cfg['nome']}: {msg}. Nova tentativa ({tentativa + 1}/{max_tentativas}) após a espera.")
+        esperar(espera, f"{cfg['nome']}: aguardando liberação")
+    return reg
+
+
+# ==============================================================================
+# 3. Normalização (resumo comparável entre as três fontes)
+# ==============================================================================
+def g(obj, *caminho):
+    for passo in caminho:
+        if isinstance(obj, dict):
+            obj = obj.get(passo)
+        elif isinstance(obj, list) and isinstance(passo, int) and -len(obj) <= passo < len(obj):
+            obj = obj[passo]
+        else:
+            return None
+        if obj is None:
+            return None
+    return obj
+
+
+def juntar(*partes, sep=" "):
+    return sep.join(str(p).strip() for p in partes if p not in (None, "") and str(p).strip())
+
+
+def data_br(valor):
+    if not valor:
+        return ""
+    s = str(valor).strip()
+    m = re.match(r"^(\d{4})-(\d{2})-(\d{2})", s)
+    return f"{m.group(3)}/{m.group(2)}/{m.group(1)}" if m else s
+
+
+def numero(valor):
+    if valor in (None, ""):
+        return None
+    try:
+        return float(str(valor).replace(",", ".")) if not isinstance(valor, (int, float)) else float(valor)
+    except ValueError:
+        return None
+
+
+def sim_nao(valor):
+    if valor is None or valor == "":
+        return ""
+    if isinstance(valor, bool):
+        return "Sim" if valor else "Não"
+    s = str(valor).strip().lower()
+    if s in ("sim", "s", "true", "1"):
+        return "Sim"
+    if s in ("não", "nao", "n", "false", "0"):
+        return "Não"
+    return str(valor)
+
+
+def fmt_cnae(codigo):
+    if codigo in (None, ""):
+        return ""
+    digitos = re.sub(r"\D", "", str(codigo))
+    if 6 <= len(digitos) <= 7:
+        d = digitos.zfill(7)
+        return f"{d[:4]}-{d[4]}/{d[5:]}"
+    return str(codigo)
+
+
+def telefone(ddd, num):
+    if not num:
+        return ""
+    return f"({ddd}) {num}" if ddd else str(num)
+
+
+def resumo_minhareceita(d):
+    secs = [s for s in (d.get("cnaes_secundarios") or []) if isinstance(s, dict) and s.get("codigo")]
+    tels = [t for t in (d.get("ddd_telefone_1"), d.get("ddd_telefone_2")) if t]
+    return {
+        "razao_social": d.get("razao_social"),
+        "nome_fantasia": d.get("nome_fantasia"),
+        "situacao_cadastral": d.get("descricao_situacao_cadastral"),
+        "data_situacao": data_br(d.get("data_situacao_cadastral")),
+        "data_abertura": data_br(d.get("data_inicio_atividade")),
+        "matriz_filial": d.get("descricao_identificador_matriz_filial"),
+        "natureza_juridica": juntar(d.get("codigo_natureza_juridica"), d.get("natureza_juridica"), sep=" - "),
+        "porte": d.get("porte"),
+        "capital_social": numero(d.get("capital_social")),
+        "cnae_principal": juntar(fmt_cnae(d.get("cnae_fiscal")), d.get("cnae_fiscal_descricao"), sep=" - "),
+        "qtd_cnaes_secundarios": len(secs),
+        "logradouro": juntar(d.get("descricao_tipo_de_logradouro"), d.get("logradouro")),
+        "numero": d.get("numero"),
+        "complemento": d.get("complemento"),
+        "bairro": d.get("bairro"),
+        "cep": d.get("cep"),
+        "municipio": d.get("municipio"),
+        "uf": d.get("uf"),
+        "telefones": " | ".join(str(t) for t in tels),
+        "email": d.get("email"),
+        "qtd_socios": len(d.get("qsa") or []),
+        "simples": sim_nao(d.get("opcao_pelo_simples")),
+        "mei": sim_nao(d.get("opcao_pelo_mei")),
+        "atualizado_na_fonte": "",
+    }
+
+
+def resumo_receitaws(d):
+    secs = [a for a in (d.get("atividades_secundarias") or [])
+            if isinstance(a, dict) and a.get("code") and a.get("code") != "00.00-0-00"]
+    return {
+        "razao_social": d.get("nome"),
+        "nome_fantasia": d.get("fantasia"),
+        "situacao_cadastral": d.get("situacao"),
+        "data_situacao": data_br(d.get("data_situacao")),
+        "data_abertura": data_br(d.get("abertura")),
+        "matriz_filial": d.get("tipo"),
+        "natureza_juridica": d.get("natureza_juridica"),
+        "porte": d.get("porte"),
+        "capital_social": numero(d.get("capital_social")),
+        "cnae_principal": juntar(fmt_cnae(g(d, "atividade_principal", 0, "code")),
+                                 g(d, "atividade_principal", 0, "text"), sep=" - "),
+        "qtd_cnaes_secundarios": len(secs),
+        "logradouro": d.get("logradouro"),
+        "numero": d.get("numero"),
+        "complemento": d.get("complemento"),
+        "bairro": d.get("bairro"),
+        "cep": d.get("cep"),
+        "municipio": d.get("municipio"),
+        "uf": d.get("uf"),
+        "telefones": d.get("telefone"),
+        "email": d.get("email"),
+        "qtd_socios": len(d.get("qsa") or []),
+        "simples": sim_nao(g(d, "simples", "optante")),
+        "mei": sim_nao(g(d, "simei", "optante")),
+        "atualizado_na_fonte": d.get("ultima_atualizacao") or "",
+    }
+
+
+def resumo_cnpjws(d):
+    e = d.get("estabelecimento") or {}
+    tels = [telefone(e.get("ddd1"), e.get("telefone1")), telefone(e.get("ddd2"), e.get("telefone2"))]
+    return {
+        "razao_social": d.get("razao_social"),
+        "nome_fantasia": e.get("nome_fantasia"),
+        "situacao_cadastral": e.get("situacao_cadastral"),
+        "data_situacao": data_br(e.get("data_situacao_cadastral")),
+        "data_abertura": data_br(e.get("data_inicio_atividade")),
+        "matriz_filial": e.get("tipo"),
+        "natureza_juridica": juntar(g(d, "natureza_juridica", "id"), g(d, "natureza_juridica", "descricao"), sep=" - "),
+        "porte": g(d, "porte", "descricao"),
+        "capital_social": numero(d.get("capital_social")),
+        "cnae_principal": juntar(fmt_cnae(g(e, "atividade_principal", "subclasse") or g(e, "atividade_principal", "id")),
+                                 g(e, "atividade_principal", "descricao"), sep=" - "),
+        "qtd_cnaes_secundarios": len(e.get("atividades_secundarias") or []),
+        "logradouro": juntar(e.get("tipo_logradouro"), e.get("logradouro")),
+        "numero": e.get("numero"),
+        "complemento": e.get("complemento"),
+        "bairro": e.get("bairro"),
+        "cep": e.get("cep"),
+        "municipio": g(e, "cidade", "nome"),
+        "uf": g(e, "estado", "sigla"),
+        "telefones": " | ".join(t for t in tels if t),
+        "email": e.get("email"),
+        "qtd_socios": len(d.get("socios") or []),
+        "simples": sim_nao(g(d, "simples", "simples")),
+        "mei": sim_nao(g(d, "simples", "mei")),
+        "atualizado_na_fonte": d.get("atualizado_em") or e.get("atualizado_em") or "",
+    }
+
+
+def socios(chave, d):
+    linhas = []
+    if chave == "minhareceita":
+        for s in d.get("qsa") or []:
+            linhas.append({
+                "nome": s.get("nome_socio"), "documento": s.get("cnpj_cpf_do_socio"),
+                "qualificacao": s.get("qualificacao_socio"),
+                "data_entrada": data_br(s.get("data_entrada_sociedade")),
+                "faixa_etaria": s.get("faixa_etaria"),
+                "representante_legal": s.get("nome_representante_legal"),
+                "qualificacao_representante": s.get("qualificacao_representante_legal"),
+            })
+    elif chave == "receitaws":
+        for s in d.get("qsa") or []:
+            linhas.append({
+                "nome": s.get("nome"), "documento": "", "qualificacao": s.get("qual"),
+                "data_entrada": "", "faixa_etaria": "",
+                "representante_legal": s.get("nome_rep_legal"),
+                "qualificacao_representante": s.get("qual_rep_legal"),
+            })
+    elif chave == "cnpjws":
+        for s in d.get("socios") or []:
+            linhas.append({
+                "nome": s.get("nome"), "documento": s.get("cpf_cnpj_socio"),
+                "qualificacao": g(s, "qualificacao_socio", "descricao"),
+                "data_entrada": data_br(s.get("data_entrada")),
+                "faixa_etaria": s.get("faixa_etaria"),
+                "representante_legal": s.get("nome_representante"),
+                "qualificacao_representante": g(s, "qualificacao_representante", "descricao"),
+            })
+    return linhas
+
+
+def cnaes_secundarios(chave, d):
+    if chave == "minhareceita":
+        itens = [(c.get("codigo"), c.get("descricao")) for c in d.get("cnaes_secundarios") or []
+                 if isinstance(c, dict) and c.get("codigo")]
+    elif chave == "receitaws":
+        itens = [(c.get("code"), c.get("text")) for c in d.get("atividades_secundarias") or []
+                 if isinstance(c, dict) and c.get("code") and c.get("code") != "00.00-0-00"]
+    else:
+        e = d.get("estabelecimento") or {}
+        itens = [(c.get("subclasse") or c.get("id"), c.get("descricao")) for c in e.get("atividades_secundarias") or []
+                 if isinstance(c, dict)]
+    return [{"codigo": fmt_cnae(c), "descricao": desc} for c, desc in itens]
+
+
+RESUMIDORES = {"minhareceita": resumo_minhareceita, "receitaws": resumo_receitaws, "cnpjws": resumo_cnpjws}
+
+CABECALHOS_RESUMO = {
+    "razao_social": "Razão social", "nome_fantasia": "Nome fantasia",
+    "situacao_cadastral": "Situação cadastral", "data_situacao": "Data da situação",
+    "data_abertura": "Data de abertura", "matriz_filial": "Matriz/Filial",
+    "natureza_juridica": "Natureza jurídica", "porte": "Porte",
+    "capital_social": "Capital social (R$)", "cnae_principal": "CNAE principal",
+    "qtd_cnaes_secundarios": "Qtd. CNAEs secundários", "logradouro": "Logradouro",
+    "numero": "Número", "complemento": "Complemento", "bairro": "Bairro", "cep": "CEP",
+    "municipio": "Município", "uf": "UF", "telefones": "Telefone(s)", "email": "E-mail",
+    "qtd_socios": "Qtd. sócios (QSA)", "simples": "Optante Simples", "mei": "MEI",
+    "atualizado_na_fonte": "Atualização na fonte",
+}
+
+
+# ==============================================================================
+# 4. Exportações
+# ==============================================================================
+def _escalar_txt(v):
+    if v is None:
+        return ""
+    if isinstance(v, bool):
+        return "Sim" if v else "Não"
+    if isinstance(v, (dict, list)):
+        return ""
+    return str(v)
+
+
+def render_txt(obj, nivel=0):
+    pad = "    " * nivel
+    linhas = []
+    if isinstance(obj, dict):
+        for k, v in obj.items():
+            if isinstance(v, (dict, list)) and v:
+                linhas.append(f"{pad}{k}:")
+                linhas += render_txt(v, nivel + 1)
+            else:
+                linhas.append(f"{pad}{k}: {_escalar_txt(v)}")
+    elif isinstance(obj, list):
+        for i, item in enumerate(obj, 1):
+            if isinstance(item, (dict, list)) and item:
+                linhas.append(f"{pad}[{i}]")
+                linhas += render_txt(item, nivel + 1)
+            else:
+                linhas.append(f"{pad}- {_escalar_txt(item)}")
+    else:
+        linhas.append(pad + _escalar_txt(obj))
+    return linhas
+
+
+def bloco_txt(item):
+    linhas = ["=" * 80, f"CNPJ {item['cnpj_formatado']}", "=" * 80]
+    if item.get("observacao"):
+        linhas.append(f"Observação: {item['observacao']}")
+    for reg in item["fontes"].values():
+        linhas += [
+            "",
+            f"--- Fonte: {reg['fonte']} ---",
+            f"URL consultada: {reg['url']}",
+            f"Consultado em: {reg['consultado_em']}",
+            f"Status: {ROTULO_STATUS.get(reg['status'], reg['status'])} (HTTP {reg['http_status']})",
+        ]
+        if reg.get("mensagem"):
+            linhas.append(f"Mensagem: {reg['mensagem']}")
+        if reg.get("dados"):
+            linhas += ["", "Dados retornados:"] + render_txt(reg["dados"], 1)
+    return "\n".join(linhas) + "\n"
+
+
+def cabecalho_txt(meta):
+    linhas = [
+        "CONSULTA DE CNPJ EM LOTE",
+        f"Gerado em: {meta['gerado_em']}",
+        f"CNPJs consultados: {meta['total_cnpjs']}",
+        "Fontes consultadas:",
+    ]
+    linhas += [f"  - {FONTES[k]['nome']}: {FONTES[k]['url'].format(cnpj='{CNPJ}')}" for k in meta["fontes"]]
+    if meta.get("interrompido"):
+        linhas.append("ATENÇÃO: execução interrompida; resultados parciais.")
+    linhas += ["", "Aviso: " + AVISO_FONTES, ""]
+    return "\n".join(linhas) + "\n"
+
+
+def achatar(obj, prefixo="", saida=None):
+    if saida is None:
+        saida = {}
+    if isinstance(obj, dict):
+        if not obj and prefixo:
+            saida[prefixo] = ""
+        for k, v in obj.items():
+            achatar(v, f"{prefixo}.{k}" if prefixo else str(k), saida)
+    elif isinstance(obj, list):
+        if not obj:
+            saida[prefixo] = ""
+        elif all(not isinstance(x, (dict, list)) for x in obj):
+            saida[prefixo] = " | ".join("" if x is None else str(x) for x in obj)
+        else:
+            saida[prefixo] = json.dumps(obj, ensure_ascii=False)
+    else:
+        saida[prefixo] = obj
+    return saida
+
+
+def linhas_planas(resultados, chave_fonte=None):
+    linhas = []
+    for item in resultados:
+        for chave, reg in item["fontes"].items():
+            if chave_fonte and chave != chave_fonte:
+                continue
+            base = {
+                "CNPJ consultado": item["cnpj_formatado"],
+                "Fonte": reg["fonte"],
+                "Status da consulta": ROTULO_STATUS.get(reg["status"], reg["status"]),
+                "HTTP": reg["http_status"],
+                "Mensagem": reg["mensagem"],
+                "Consultado em": reg["consultado_em"],
+                "URL consultada": reg["url"],
+            }
+            base.update(achatar(reg["dados"]) if reg.get("dados") else {})
+            linhas.append(base)
+    return linhas
+
+
+RE_CTRL = re.compile(r"[\x00-\x08\x0B\x0C\x0E-\x1F]")
+LIMITE_CELULA = 32000
+
+
+def _limpar_excel(v):
+    if isinstance(v, str):
+        v = RE_CTRL.sub("", v)
+        if len(v) > LIMITE_CELULA:
+            v = v[:LIMITE_CELULA] + " [...] (truncado: ver JSON)"
+    return v
+
+
+def _df_excel(linhas, colunas=None):
+    df = pd.DataFrame(linhas, columns=colunas)
+    for c in df.columns:
+        if df[c].dtype == object:
+            df[c] = df[c].map(_limpar_excel)
+    return df
+
+
+def _formatar_aba(ws, df):
+    from openpyxl.styles import Alignment, Font, PatternFill
+    from openpyxl.utils import get_column_letter
+
+    cabecalho = PatternFill("solid", fgColor="1F3864")
+    for cel in ws[1]:
+        cel.font = Font(bold=True, color="FFFFFF")
+        cel.fill = cabecalho
+        cel.alignment = Alignment(vertical="center", wrap_text=True)
+    ws.freeze_panes = "A2"
+    if ws.max_row > 1 and ws.max_column > 0:
+        ws.auto_filter.ref = ws.dimensions
+    for i, col in enumerate(df.columns, 1):
+        amostra = [len(str(col))] + [len(str(v)) for v in df[col].head(300) if v is not None]
+        ws.column_dimensions[get_column_letter(i)].width = max(10, min(55, max(amostra) + 2))
+        if col == "Capital social (R$)":
+            for linha in range(2, ws.max_row + 1):
+                ws.cell(row=linha, column=i).number_format = "#,##0.00"
+
+
+def exportar(resultados, invalidos, meta, opcoes, pasta):
+    gerados = []
+    os.makedirs(pasta, exist_ok=True)
+    carimbo = meta["carimbo"]
+
+    # a) TXT por CNPJ
+    if "txt_por_cnpj" in opcoes:
+        sub = os.path.join(pasta, "txt_por_cnpj")
+        os.makedirs(sub, exist_ok=True)
+        for item in resultados:
+            caminho = os.path.join(sub, f"{item['cnpj']}.txt")
+            with open(caminho, "w", encoding="utf-8") as f:
+                f.write(cabecalho_txt({**meta, "total_cnpjs": 1}) + bloco_txt(item))
+            gerados.append(caminho)
+
+    # b) JSON por CNPJ
+    if "json_por_cnpj" in opcoes:
+        sub = os.path.join(pasta, "json_por_cnpj")
+        os.makedirs(sub, exist_ok=True)
+        for item in resultados:
+            caminho = os.path.join(sub, f"{item['cnpj']}.json")
+            with open(caminho, "w", encoding="utf-8") as f:
+                json.dump(item, f, ensure_ascii=False, indent=2)
+            gerados.append(caminho)
+
+    # c) TXT consolidado
+    if "txt_consolidado" in opcoes:
+        caminho = os.path.join(pasta, f"cnpjs_consolidado_{carimbo}.txt")
+        with open(caminho, "w", encoding="utf-8") as f:
+            f.write(cabecalho_txt(meta))
+            for item in resultados:
+                f.write("\n" + bloco_txt(item))
+            if invalidos:
+                f.write("\n" + "=" * 80 + "\nCNPJs com dígito verificador inválido (não consultados)\n" + "=" * 80 + "\n")
+                for inv in invalidos:
+                    f.write(f"- {inv['entrada_original']}\n")
+        gerados.append(caminho)
+
+    # d) JSON consolidado
+    if "json_consolidado" in opcoes:
+        caminho = os.path.join(pasta, f"cnpjs_consolidado_{carimbo}.json")
+        pacote = {
+            "gerado_em": meta["gerado_em"],
+            "aviso": AVISO_FONTES,
+            "fontes": {k: {"nome": FONTES[k]["nome"], "url_modelo": FONTES[k]["url"]} for k in meta["fontes"]},
+            "execucao": meta["estatisticas"],
+            "interrompido": meta.get("interrompido", False),
+            "cnpjs_invalidos_nao_consultados": invalidos,
+            "resultados": resultados,
+        }
+        with open(caminho, "w", encoding="utf-8") as f:
+            json.dump(pacote, f, ensure_ascii=False, indent=2)
+        gerados.append(caminho)
+
+    # e) CSV consolidado (uma linha por CNPJ x fonte; listas aninhadas em JSON)
+    if "csv" in opcoes:
+        caminho = os.path.join(pasta, f"cnpjs_consolidado_{carimbo}.csv")
+        pd.DataFrame(linhas_planas(resultados)).to_csv(caminho, sep=";", index=False, encoding="utf-8-sig")
+        gerados.append(caminho)
+
+    # f) XLSX com abas
+    if "xlsx" in opcoes:
+        caminho = os.path.join(pasta, f"cnpjs_consolidado_{carimbo}.xlsx")
+        resumo, tab_socios, tab_cnaes, log = [], [], [], []
+        for item in resultados:
+            for chave, reg in item["fontes"].items():
+                linha = {"CNPJ": item["cnpj_formatado"], "Fonte": reg["fonte"],
+                         "Status da consulta": ROTULO_STATUS.get(reg["status"], reg["status"])}
+                if reg.get("dados"):
+                    try:
+                        r = RESUMIDORES[chave](reg["dados"])
+                    except Exception as e:  # formato inesperado da fonte
+                        r = {}
+                        linha["Status da consulta"] += f" (resumo indisponível: {type(e).__name__})"
+                    linha.update({CABECALHOS_RESUMO[k]: v for k, v in r.items()})
+                    for s in socios(chave, reg["dados"]):
+                        tab_socios.append({"CNPJ": item["cnpj_formatado"], "Fonte": reg["fonte"], **s})
+                    for c in cnaes_secundarios(chave, reg["dados"]):
+                        tab_cnaes.append({"CNPJ": item["cnpj_formatado"], "Fonte": reg["fonte"], **c})
+                resumo.append(linha)
+                log.append({
+                    "CNPJ": item["cnpj_formatado"], "Fonte": reg["fonte"],
+                    "Status": ROTULO_STATUS.get(reg["status"], reg["status"]),
+                    "HTTP": reg["http_status"], "Mensagem": reg["mensagem"],
+                    "Tentativas": reg["tentativas"], "Duração (s)": reg["duracao_s"],
+                    "Consultado em": reg["consultado_em"], "URL": reg["url"],
+                })
+
+        abas = [
+            ("Resumo", _df_excel(resumo, ["CNPJ", "Fonte", "Status da consulta"] + list(CABECALHOS_RESUMO.values()))),
+            ("Sócios", _df_excel(tab_socios, ["CNPJ", "Fonte", "nome", "documento", "qualificacao", "data_entrada",
+                                              "faixa_etaria", "representante_legal", "qualificacao_representante"])),
+            ("CNAEs secundários", _df_excel(tab_cnaes, ["CNPJ", "Fonte", "codigo", "descricao"])),
+        ]
+        nomes_aba = {"minhareceita": "Minha Receita (completo)", "receitaws": "ReceitaWS (completo)",
+                     "cnpjws": "CNPJ.ws (completo)"}
+        for chave in meta["fontes"]:
+            abas.append((nomes_aba[chave], _df_excel(linhas_planas(resultados, chave))))
+        abas.append(("Log de consultas", _df_excel(log)))
+        if invalidos:
+            abas.append(("DV inválido", _df_excel(invalidos)))
+        sobre = [
+            {"Campo": "Gerado em", "Valor": meta["gerado_em"]},
+            {"Campo": "CNPJs consultados", "Valor": meta["total_cnpjs"]},
+            {"Campo": "Fontes", "Valor": ", ".join(FONTES[k]["nome"] for k in meta["fontes"])},
+            {"Campo": "Execução interrompida?", "Valor": "Sim" if meta.get("interrompido") else "Não"},
+            {"Campo": "Aviso", "Valor": AVISO_FONTES},
+        ]
+        abas.append(("Sobre", _df_excel(sobre)))
+
+        with pd.ExcelWriter(caminho, engine="openpyxl") as writer:
+            for nome, df in abas:
+                df.to_excel(writer, sheet_name=nome[:31], index=False)
+                _formatar_aba(writer.sheets[nome[:31]], df)
+        gerados.append(caminho)
+
+    return gerados
+
+
+
+
+def empacotar(pasta, gerados):
+    if not gerados:
+        return None
+    if len(gerados) == 1:
+        return gerados[0]
+    alvo = pasta.rstrip("/") + ".zip"
+    with zipfile.ZipFile(alvo, "w", zipfile.ZIP_DEFLATED) as z:
+        for caminho in gerados:
+            z.write(caminho, os.path.relpath(caminho, os.path.dirname(pasta)))
+    return alvo
+
+
+ULTIMO_ARQUIVO = None
+
+
+def baixar_novamente():
+    if not ULTIMO_ARQUIVO:
+        print("Nenhuma consulta foi exportada ainda.")
+    elif EM_COLAB:
+        colab_files.download(ULTIMO_ARQUIVO)
+    else:
+        print(f"Arquivo em: {ULTIMO_ARQUIVO}")
+
+
+def _fmt_tempo(seg):
+    seg = max(0, int(seg))
+    if seg < 60:
+        return f"{seg}s"
+    m, s = divmod(seg, 60)
+    if m < 60:
+        return f"{m}min{s:02d}s"
+    h, m = divmod(m, 60)
+    return f"{h}h{m:02d}min"
+
+
+# ==============================================================================
+# 5. Consulta em lote (tudo com saída ao vivo na própria célula)
+# ==============================================================================
+def consultar_lote(texto, fontes=("minhareceita", "receitaws", "cnpjws"),
+                   exports=("json_consolidado", "xlsx"), intervalos=None,
+                   tentativas=3, timeout=30, incluir_invalidos=False, baixar=True):
+    global ULTIMO_ARQUIVO
+    fontes_sel = [k for k in FONTES if k in fontes]
+    exports = set(exports)
+    if not fontes_sel:
+        print("⚠️ Nenhuma fonte selecionada.")
+        return None
+    if not exports:
+        print("⚠️ Nenhum formato de exportação selecionado.")
+        return None
+
+    validos, invalidos, duplicados = extrair_cnpjs(texto)
+    print(f"✔ {len(validos)} CNPJ(s) válido(s) e único(s) identificado(s).")
+    if duplicados:
+        print(f"↺ {len(duplicados)} repetido(s) ignorado(s).")
+    if invalidos:
+        print(f"✖ {len(invalidos)} com dígito verificador inválido"
+              f"{' (serão consultados mesmo assim)' if incluir_invalidos else ' (não serão consultados)'}: "
+              + ", ".join(i["entrada_original"] for i in invalidos[:15]) + (" ..." if len(invalidos) > 15 else ""))
+    lista = validos + (invalidos if incluir_invalidos else [])
+    if not lista:
+        print("\nNenhum CNPJ para consultar. Confira o texto colado e execute a célula de novo.")
+        return None
+
+    ritmo = {k: float((intervalos or {}).get(k, FONTES[k]["intervalo"])) for k in fontes_sel}
+    estimativa = len(lista) * max(ritmo.values()) + len(lista) * len(fontes_sel) * 0.7
+    print(f"Fontes: {', '.join(FONTES[k]['nome'] for k in fontes_sel)}")
+    print(f"Tempo estimado: ~{_fmt_tempo(estimativa)} para {len(lista)} CNPJ(s) x {len(fontes_sel)} fonte(s).")
+    print("Para interromper, clique no ■ da célula: o que já foi consultado será exportado.")
+    print("=" * 70, flush=True)
+
+    resultados = []
+    proxima = {k: 0.0 for k in fontes_sel}
+    interrompido = False
+    inicio = time.monotonic()
+    n = len(lista)
+
+    try:
+        for i, entrada in enumerate(lista, 1):
+            decorrido = time.monotonic() - inicio
+            restante = (decorrido / (i - 1)) * (n - i + 1) if i > 1 else estimativa
+            print(f"\n[{i}/{n}] {entrada['cnpj_formatado']}   ·   {hora()}   ·   "
+                  f"{(i - 1) * 100 // n}% concluído   ·   restante ~{_fmt_tempo(restante)}", flush=True)
+            item = {"cnpj": entrada["cnpj"], "cnpj_formatado": entrada["cnpj_formatado"],
+                    "entrada_original": entrada["entrada_original"],
+                    "observacao": entrada["observacao"], "fontes": {}}
+            resultados.append(item)
+            for k in fontes_sel:
+                espera = proxima[k] - time.monotonic()
+                if espera > 0:
+                    esperar(espera, f"{FONTES[k]['nome']}: aguardando limite de consultas")
+                print(f"      → {FONTES[k]['nome']}: consultando...", end="", flush=True)
+                reg = consultar_fonte(k, entrada["cnpj"], timeout=timeout, max_tentativas=tentativas,
+                                      log=lambda m: print("\n" + m, flush=True))
+                proxima[k] = time.monotonic() + ritmo[k]
+                item["fontes"][k] = reg
+                nome = ""
+                if reg["dados"]:
+                    try:
+                        nome = " · " + str(RESUMIDORES[k](reg["dados"]).get("razao_social") or "")
+                    except Exception:
+                        pass
+                msg = f" · {reg['mensagem']}" if reg["status"] != "ok" and reg["mensagem"] else ""
+                print(f"\r      → {FONTES[k]['nome']}: {ROTULO_STATUS.get(reg['status'], reg['status'])}"
+                      f"{nome}{msg} ({reg['duracao_s']}s){' ' * 12}", flush=True)
+    except KeyboardInterrupt:
+        interrompido = True
+        print("\n\n⏹️ Interrompido pelo usuário. Exportando o que já foi consultado...", flush=True)
+
+    if resultados and not resultados[-1]["fontes"]:
+        resultados.pop()
+    if not resultados:
+        print("Nada foi consultado; nenhum arquivo gerado.")
+        return None
+
+    estatisticas = {}
+    for k in fontes_sel:
+        cont = {}
+        for item in resultados:
+            reg = item["fontes"].get(k)
+            if reg:
+                cont[reg["status"]] = cont.get(reg["status"], 0) + 1
+        estatisticas[FONTES[k]["nome"]] = cont
+
+    momento = agora()
+    meta = {
+        "gerado_em": momento.strftime("%d/%m/%Y %H:%M:%S (%Z)"),
+        "carimbo": momento.strftime("%Y%m%d_%H%M%S"),
+        "fontes": fontes_sel,
+        "total_cnpjs": len(resultados),
+        "estatisticas": estatisticas,
+        "interrompido": interrompido,
+        "duracao_s": round(time.monotonic() - inicio, 1),
+    }
+    print("\n" + "=" * 70)
+    print("📦 Gerando arquivos...", flush=True)
+    pasta = os.path.join(PASTA_BASE, f"consulta_cnpj_{meta['carimbo']}")
+    gerados = exportar(resultados, [] if incluir_invalidos else invalidos, meta, exports, pasta)
+    ULTIMO_ARQUIVO = empacotar(pasta, gerados)
+
+    for fonte, cont in estatisticas.items():
+        partes = ", ".join(f"{ROTULO_STATUS.get(s, s)}: {q}" for s, q in cont.items())
+        print(f"{fonte} → {partes}")
+    print(f"Duração total: {_fmt_tempo(meta['duracao_s'])} · {len(gerados)} arquivo(s) gerado(s)")
+    print(f"Pasta no Colab: {pasta}")
+    print(f"Arquivo para download: {os.path.basename(ULTIMO_ARQUIVO)}")
+    if baixar and EM_COLAB:
+        try:
+            colab_files.download(ULTIMO_ARQUIVO)
+            print("⬇ Download iniciado. Se não começar, rode baixar_novamente() em outra célula "
+                  "ou use o painel Arquivos (ícone de pasta à esquerda).")
+        except Exception as e:
+            print(f"⚠️ Download automático falhou ({e}). Use o painel Arquivos (ícone de pasta à esquerda).")
+    print("✅ Fim. Para uma nova consulta, execute a célula de novo.")
+    return resultados
+
+
+# ==============================================================================
+# 6. Formulário (HTML na própria célula; a célula aguarda o clique)
+# ==============================================================================
+_FORM_HTML = r"""
+<style>
+#ID { font-family: system-ui, -apple-system, Segoe UI, Roboto, sans-serif; color: inherit;
+      max-width: 860px; border: 1px solid #8884; border-radius: 10px; padding: 16px 18px; }
+#ID h3 { margin: 0 0 4px; font-size: 18px; }
+#ID .sub { opacity: .75; font-size: 13px; margin-bottom: 12px; }
+#ID .bloco { margin: 14px 0 6px; font-weight: 600; font-size: 14px; }
+#ID textarea { width: 100%; height: 200px; box-sizing: border-box; padding: 8px; font: 13px/1.4 ui-monospace, Consolas, monospace;
+      background: transparent; color: inherit; border: 1px solid #8888; border-radius: 6px; resize: vertical; }
+#ID label { display: block; margin: 4px 0; font-size: 14px; cursor: pointer; }
+#ID .grid { display: grid; grid-template-columns: 1fr 1fr; gap: 0 18px; }
+#ID details { margin-top: 12px; font-size: 13px; }
+#ID details label { display: flex; justify-content: space-between; align-items: center; max-width: 520px; gap: 12px; }
+#ID input[type=number] { width: 80px; background: transparent; color: inherit; border: 1px solid #8888; border-radius: 4px; padding: 2px 4px; }
+#ID .contador { font-size: 13px; margin-top: 6px; opacity: .9; }
+#ID .barra { display: flex; align-items: center; gap: 14px; margin-top: 16px; flex-wrap: wrap; }
+#ID button { background: #1a73e8; color: #fff; border: 0; border-radius: 6px; padding: 9px 22px; font-size: 14px; font-weight: 600; cursor: pointer; }
+#ID button:disabled { background: #888; cursor: default; }
+#ID .aviso { color: #d93025; font-size: 13px; font-weight: 600; }
+@media (max-width: 640px) { #ID .grid { grid-template-columns: 1fr; } }
+</style>
+<div id="ID">
+  <h3>Consulta de CNPJ em lote</h3>
+  <div class="sub">Minha Receita · ReceitaWS · CNPJ.ws (pública). O andamento aparece logo abaixo deste painel.</div>
+
+  <div class="bloco">1. CNPJs</div>
+  <textarea id="ID-texto" placeholder="Cole aqui os CNPJs, em qualquer destes formatos:&#10;12.345.678/0001-95&#10;12345678000195; 11222333000181; ...&#10;12345678000195, 11222333000181, ...&#10;Ou texto corrido: ... contrato com a empresa X, CNPJ 12.345.678/0001-95, ...&#10;(no texto corrido só entram CNPJs formatados; o formato alfanumérico também é aceito)"></textarea>
+  <div class="contador" id="ID-contador">Nenhum CNPJ identificado ainda.</div>
+
+  <div class="bloco">2. Fontes a consultar</div>
+  <label><input type="checkbox" name="fonte" value="minhareceita" checked> Minha Receita · minhareceita.org (rápida)</label>
+  <label><input type="checkbox" name="fonte" value="receitaws" checked> ReceitaWS · receitaws.com.br (3 consultas/min)</label>
+  <label><input type="checkbox" name="fonte" value="cnpjws" checked> CNPJ.ws pública · publica.cnpj.ws (3 consultas/min)</label>
+
+  <div class="bloco">3. Formatos de exportação</div>
+  <div class="grid">
+    <label><input type="checkbox" name="exp" value="txt_por_cnpj"> a) TXT por CNPJ (um arquivo para cada)</label>
+    <label><input type="checkbox" name="exp" value="json_por_cnpj"> b) JSON por CNPJ (um arquivo para cada)</label>
+    <label><input type="checkbox" name="exp" value="txt_consolidado"> c) TXT consolidado (com a fonte de cada dado)</label>
+    <label><input type="checkbox" name="exp" value="json_consolidado" checked> d) JSON consolidado</label>
+    <label><input type="checkbox" name="exp" value="csv"> e) CSV consolidado (; e UTF-8, abre no Excel)</label>
+    <label><input type="checkbox" name="exp" value="xlsx" checked> f) XLSX (Resumo, Sócios, CNAEs, dados por fonte, Log)</label>
+  </div>
+
+  <details>
+    <summary>Opções avançadas</summary>
+    <label>Intervalo entre consultas · Minha Receita (s) <input type="number" id="ID-int-minhareceita" value="IV_MR" min="0" step="0.5"></label>
+    <label>Intervalo entre consultas · ReceitaWS (s) <input type="number" id="ID-int-receitaws" value="IV_RW" min="0" step="0.5"></label>
+    <label>Intervalo entre consultas · CNPJ.ws (s) <input type="number" id="ID-int-cnpjws" value="IV_CW" min="0" step="0.5"></label>
+    <label>Tentativas por consulta (em limite ou falha) <input type="number" id="ID-tentativas" value="3" min="1" max="10"></label>
+    <label>Tempo máximo de resposta (s) <input type="number" id="ID-timeout" value="30" min="5" max="180"></label>
+    <label style="justify-content:flex-start"><input type="checkbox" id="ID-invalidos"> Consultar também CNPJs com dígito verificador inválido</label>
+    <label style="justify-content:flex-start"><input type="checkbox" id="ID-baixar" checked> Baixar automaticamente ao final (ZIP se houver mais de um arquivo)</label>
+  </details>
+
+  <div class="barra">
+    <button id="ID-btn">▶ Consultar</button>
+    <span class="aviso" id="ID-aviso"></span>
+  </div>
+</div>
+"""
+
+_FORM_JS = r"""
+(() => {
+  const ID = "%ID%";
+  const $ = (s) => document.getElementById(ID + s);
+  const root = document.getElementById(ID);
+  const P1 = [5,4,3,2,9,8,7,6,5,4,3,2], P2 = [6].concat(P1);
+  const val = (ch) => ch.charCodeAt(0) - 48;
+  const dv = (b, p) => { let s = 0; for (let i = 0; i < p.length; i++) s += val(b[i]) * p[i]; const r = s % 11; return r < 2 ? 0 : 11 - r; };
+  const dvOk = (c) => {
+    if (!/^[A-Z0-9]{12}\d{2}$/.test(c) || /^(.)\1{13}$/.test(c)) return false;
+    const d1 = dv(c, P1), d2 = dv(c.slice(0, 12) + d1, P2);
+    return c.slice(12) === String(d1) + String(d2);
+  };
+  const extrair = (t) => {
+    const out = [];
+    for (let tok of (t || "").toUpperCase().split(/[\r\n;,\t]+/)) {
+      tok = tok.trim(); if (!tok) continue;
+      const m = tok.match(/(?<![A-Z0-9])[A-Z0-9]{2}\.[A-Z0-9]{3}\.[A-Z0-9]{3}\/[A-Z0-9]{4}-\d{2}(?![A-Z0-9])/g);
+      if (m) { m.forEach(x => out.push(x.replace(/[^A-Z0-9]/g, ""))); continue; }
+      const l = tok.replace(/[\s.\/\-"']/g, "");
+      if (/^\d{12,13}$/.test(l)) out.push(l.padStart(14, "0"));
+      else if (/^[A-Z0-9]{12}\d{2}$/.test(l)) out.push(l);
+    }
+    const unicos = [...new Set(out)];
+    const validos = unicos.filter(dvOk).length;
+    return { validos, invalidos: unicos.length - validos, repetidos: out.length - unicos.length };
+  };
+  const marcados = (nome) => [...root.querySelectorAll(`input[name=${nome}]:checked`)].map(e => e.value);
+  const tempo = (s) => s < 60 ? `${Math.round(s)}s` : (s < 3600 ? `${Math.round(s / 60)} min` : `${(s / 3600).toFixed(1)} h`);
+  const atualizar = () => {
+    const r = extrair($("-texto").value);
+    const fontes = marcados("fonte");
+    const incluir = $("-invalidos").checked;
+    const n = r.validos + (incluir ? r.invalidos : 0);
+    const maior = Math.max(0, ...fontes.map(f => parseFloat($("-int-" + f).value) || 0));
+    let txt = `✔ ${r.validos} CNPJ(s) válido(s)`;
+    if (r.invalidos) txt += ` · ✖ ${r.invalidos} com DV inválido`;
+    if (r.repetidos) txt += ` · ↺ ${r.repetidos} repetido(s)`;
+    if (n && fontes.length) txt += ` · tempo estimado ~${tempo(n * maior + n * fontes.length * 0.7)}`;
+    $("-contador").textContent = (r.validos || r.invalidos) ? txt : "Nenhum CNPJ identificado ainda.";
+  };
+  root.addEventListener("input", atualizar);
+  root.addEventListener("change", atualizar);
+
+  return new Promise((resolve) => {
+    $("-btn").onclick = () => {
+      const fontes = marcados("fonte"), exps = marcados("exp");
+      const r = extrair($("-texto").value);
+      const aviso = $("-aviso");
+      if (!r.validos && !(r.invalidos && $("-invalidos").checked)) { aviso.textContent = "Nenhum CNPJ válido identificado."; return; }
+      if (!fontes.length) { aviso.textContent = "Marque pelo menos uma fonte."; return; }
+      if (!exps.length) { aviso.textContent = "Marque pelo menos um formato de exportação."; return; }
+      const num = (s, d) => { const v = parseFloat($(s).value); return isNaN(v) ? d : v; };
+      const dados = {
+        texto: $("-texto").value, fontes: fontes, exports: exps,
+        intervalos: { minhareceita: num("-int-minhareceita", IV_MR), receitaws: num("-int-receitaws", IV_RW), cnpjws: num("-int-cnpjws", IV_CW) },
+        tentativas: Math.round(num("-tentativas", 3)), timeout: Math.round(num("-timeout", 30)),
+        incluir_invalidos: $("-invalidos").checked, baixar: $("-baixar").checked,
+      };
+      root.querySelectorAll("input, textarea, button").forEach(e => e.disabled = true);
+      $("-btn").textContent = "⏳ Consultando... acompanhe o andamento abaixo";
+      aviso.textContent = "";
+      resolve(JSON.stringify(dados));
+    };
+  });
+})()
+"""
+
+
+def abrir_formulario():
+    uid = "cnpjform" + str(int(time.time() * 1000))
+    iv = {"IV_MR": FONTES["minhareceita"]["intervalo"], "IV_RW": FONTES["receitaws"]["intervalo"],
+          "IV_CW": FONTES["cnpjws"]["intervalo"]}
+    html, js = _FORM_HTML.replace("ID", uid), _FORM_JS.replace("%ID%", uid)
+    for chave, valor in iv.items():
+        html, js = html.replace(chave, str(valor)), js.replace(chave, str(valor))
+    display(HTML(html))
+    # A célula fica aguardando aqui até o clique em "Consultar".
+    dados = json.loads(colab_output.eval_js(js, timeout_sec=None))
+    print(f"▶ Consulta iniciada às {hora()}.", flush=True)
+    return consultar_lote(
+        dados["texto"], fontes=dados["fontes"], exports=dados["exports"],
+        intervalos=dados["intervalos"], tentativas=dados["tentativas"], timeout=dados["timeout"],
+        incluir_invalidos=dados["incluir_invalidos"], baixar=dados["baixar"],
+    )
+
+
+if EM_COLAB:
+    resultados = abrir_formulario()
+else:
+    print("Fora do Colab o formulário não é exibido. Use, por exemplo:\n"
+          "resultados = consultar_lote('12.345.678/0001-95; 11.222.333/0001-81', "
+          "exports=['xlsx', 'json_consolidado'])")
